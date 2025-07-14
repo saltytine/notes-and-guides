@@ -3,6 +3,36 @@
 see official documentation [here](https://documentation.ubuntu.com/canonical-kubernetes/latest/).  
 charmed kubernetes is canonical’s enterprise kubernetes distribution, designed to provide a model-driven, fully managed container orchestration platform on ubuntu.  it uses juju “charms” to model and operate each kubernetes component, enabling automated deployment, upgrades, and scaling of clusters on any infrastructure.  in practice, a juju controller and model define the cluster topology – for example, an etcd cluster charm, multiple kubernetes-control-plane units, and kubernetes-worker units – with charms for network, storage, and other services all related together.  this approach makes charmed k8s highly modular and adaptable to environments from bare-metal to public cloud.  the architecture diagram below illustrates this model-driven design: juju sits at the center orchestrating container runtimes (something like containerd or kata), cnis (calico/flannel), storage (ceph), and observability (prometheus, grafana, loki, etc.) in a unified stack.
 
+```
+                          +------------------+
+                          |  juju controller |
+                          +--------+---------+
+                                   |
+                          +--------v---------+
+                          |   juju model     |
+                          +--------+---------+
+                                   |
+        +--------------------------+---------------------------+
+        |                          |                           |
+        v                          v                           v
++-----------------+       +--------------------+      +--------------------+
+| kubernetes-ctl  |       |   etcd (cluster)   |      |  kubernetes-worker |
+| (control-plane) |<----->| (tls, quorum 3/5)  |<---->|   (kubelet, cni)   |
++-----------------+       +--------------------+      +--------------------+
+        |                          |                           |
+        v                          v                           v
++----------------+     +--------------------+       +---------------------+
+|  containerd    |     |   easyrsa/vault    |       |     cni plugin      |
+| (or kata opt.) |     |    (tls certs)     |       | (calico/flannel/..) |
++----------------+     +--------------------+       +---------------------+
+
+                         +--------------------+
+                         |   observability    |
+                         | (prom, loki, etc.) |
+                         +--------------------+
+
+```
+
 the design philosophy is declarative and “day-2” automated – charmed kubernetes aims to manage the entire lifecycle (deployment, updates, scaling, failure recovery) without manual intervention.  by default every core kubernetes service is delivered as a juju charm.  for example, the kubernetes-control-plane charm runs the api server, controller-manager, and scheduler; the kubernetes-worker charm runs kubelet, kube-proxy and a container runtime; and the etcd charm runs a tls-enabled etcd cluster.  this means updates (via juju “charm refresh” or snap refresh) and configuration changes (via juju model configs) can be applied uniformly to all units.  because the bundle uses ubuntu snaps for kubernetes binaries, os and security patches are delivered automatically, ensuring cncf-certified kubernetes with up-to-date fixes.  charmed k8s also supports advanced infrastructure features: like full oci compatibility (containerd and docker), pci passthrough (gpu/fpga/sr-iov), and multi-arch (x86/arm) for iot/edge use.
 
 ## components
@@ -27,6 +57,22 @@ juju also provides overlays and bundles.  bundles specify a set of charms and re
 ## deployment and lifecycle management
 
 charmed kubernetes clusters are typically deployed via juju bundles on a juju model.  by default, the charmed-kubernetes bundle will deploy a single control-plane unit (plus etcd and easyrsa) and one or more workers.  for production, an ha topology is used (see below).  the deployment sequence (as in a bundle) is generally: bootstrap juju controller, add target machines (like with juju add-machine), then juju deploy charmed-kubernetes --overlay <custom.yaml>.  juju will provision machines (or spin up vms), install charms and snaps, and relate them.  for example, in a minimal core setup juju would install one unit each of kubernetes-control-plane, etcd, and easyrsa on a machine, and one kubernetes-worker on another.  the control-plane registers with etcd (via the tls-certificates interface), and the worker registers with the api server.  the installer then provides a kubeconfig to allow kubectl access.
+```
+example deployment:
+-----------------
+1. juju bootstrap <cloud>
+2. juju add-model <model-name>
+3. juju add-machine (optional)
+4. juju deploy charmed-kubernetes --overlay <custom.yaml>
+
+result:
+---------------------
+[etcd] <--> [kubernetes-control-plane] <--> [kubernetes-worker]
+   |                   |                            |
+   v                   v                            v
+[easyrsa]        [kubeapi-load-balancer]       [containerd + CNI]
+
+```
 
 ### high availability
 
@@ -51,6 +97,28 @@ the etcd database holds the cluster state (objects, secrets, etc), so it must be
 network: charmed k8s uses a container networking interface (cni) plugin for pod networking.  by default it deploys calico, which supports bgp/overlay networking and network policy.  calico is installed as a subordinate charm to the worker/control-plane and configures the cluster network.  alternately, flannel or canal (flannel+calico) are available charms.  to switch, one uses a juju overlay that removes the default calico relation and adds the new cni charm.  for l2 load balancing (for services of type=loadbalancer), metallb can be deployed (canonical provides metallb-speaker and metallb-controller charms) and ip addresses allocated for vips on bare-metal.  in the cloud, operators typically use the cloud’s own lb (via the aws/azure/gcp integrator charms).  for ingress to cluster services, any ingress controller (nginx, contour, traefik, etc.) can be deployed via its juju charm or a helm chart.
 
 storage: charmed k8s integrates with block and file storage via csi drivers.  for example, to use ceph, an operator deploys ceph-mon and ceph-osd charms to form a ceph cluster, then the ceph-csi charm to provide rbd and cephfs volume classes.  the bundles in charmhub often include these for ease.  pvs are then provisioned by creating persistentvolumeclaims using those storage classes.  other csi drivers (aws ebs, azure disk, csi-csi for gcp) can also be used via cloud provider operator charms.  juju itself can also manage storage integrations: for instance, the csi:rbd storage relation from kubernetes-control-plane to ceph-rbd populates the necessary secrets and endpoints in the cluster.  in practice, any kubernetes volume type is supported as long as there’s a charms or cloud service backing it.
+```
+networking:
+-----------
+[kubernetes-worker] <---> [cni plugin: calico/flannel/cilium]
+                              |
+                              v
+                      [pod to pod networking]
+                              |
+                              v
+                  [metallb or cloud lb or ingress or something]
+
+storage:
+--------
+[kubernetes-control-plane / worker]
+            |
+            v
+      [ceph-csi charm]
+            |
+            v
+  [ceph cluster: ceph-mon + ceph-osd]
+
+```
 
 ## observability stack
 
@@ -88,6 +156,22 @@ charmed k8s fits into modern ci/cd workflows through gitops and operators.  for 
 for pipeline automation, jenkins can be deployed on the kubernetes cluster using the jenkins-k8s-operator charm.  this provides a continuous integration server managed by juju; pipeline jobs can be created to build and test applications on the cluster.  the jenkins kubernetes operator allows dynamic provisioning of jenkins agents as pods.  alternatively, teams often run jenkins or other ci servers outside the cluster and use juju or kubectl calls in their pipeline scripts.  canonical’s own ci for charmed k8s uses jenkins and github actions (like the charmed-kubernetes/jenkins repository) to build and test releases.
 
 in short, charmed k8s does not mandate a specific ci tool – it is fully compatible with gitops (via flux/argo/github actions for kubernetes apps, and juju-managed gitops for infra) and with jenkins pipelines.  the jenkins-k8s-operator and community github action examples show how tightly juju can integrate with ci/cd pipelines.
+```
+[ git repo ]
+     |
+     v
+[ gitHub actions / jenkins ]
+     |
+     v
+[ juju cli scripts / flux / argo ]
+     |
+     v
+[ juju controller ]
+     |
+     v
+[ charmed k8s deployment ]
+
+```
 
 ## troubleshooting and best practices
 
